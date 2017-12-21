@@ -12,7 +12,7 @@ var (
 	<label>WooCommerce</label>
 	<oauthConfig>
 		<callbackUrl>https://login.salesforce.com/services/oauth2/callback</callbackUrl>
-		<consumerKey>CLIENTID</consumerKey>
+		<consumerKey required="true">CLIENTID</consumerKey>
 		<scopes>Basic</scopes>
 		<scopes>Api</scopes>
 		<scopes>Web</scopes>
@@ -26,7 +26,8 @@ var (
     <label>WooCommerce</label>
     <oauthConfig>
         <callbackUrl>https://login.salesforce.com/services/oauth2/callback</callbackUrl>
-        <consumerKey>OTHER</consumerKey>
+		<consumerKey>OTHER</consumerKey>
+		<!--Comment-->
         <scopes>Full</scopes>
         <scopes>Basic</scopes>
     </oauthConfig>
@@ -42,13 +43,13 @@ func TestParseDoc(t *testing.T) {
 	if !tree.Root.IsRoot() {
 		t.Error("Not root.")
 	}
-	if len(tree.Leafs) != 22 {
+	if len(tree.Leafs) != 9 {
 		t.Errorf("Incorrect number of leafs, got %d.", len(tree.Leafs))
 	}
 	for i, leaf := range tree.Leafs {
-		if i == 5 {
+		if i == 2 {
 			if string(leaf.Content) != "WooCommerce" {
-				t.Errorf("Sixth leaf incorrect, got %s.", leaf.Content)
+				t.Errorf("Third leaf incorrect, got %s.", leaf.Content)
 			}
 		}
 	}
@@ -62,7 +63,7 @@ func TestCompare(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(deltas) != 3 {
+	if len(deltas) != 5 {
 		t.Errorf("Incorrect number of deltas, got %d.", len(deltas))
 	}
 }

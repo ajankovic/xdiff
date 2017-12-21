@@ -82,12 +82,15 @@ func (n *Node) IsRoot() bool {
 func (n *Node) String() string {
 	hash := hex.EncodeToString(n.Hash)
 	leaf := ""
+	child := ""
 	if n.IsLeaf {
 		leaf = "leaf"
+	} else {
+		child = string(n.Children[0].Content)
 	}
 	if n.Name.Local != "" {
 		return fmt.Sprintf("%s:%s [%s] {%s}",
-			n.Name.Local, leaf, n.Signature, hash)
+			n.Name.Local, child, n.Signature, hash)
 	}
 	if n.Content != nil {
 		return fmt.Sprintf("%s:%q [%s] {%s}", leaf, n.Content, n.Signature, hash)
@@ -172,7 +175,7 @@ loop:
 					IsLeaf:  true,
 					Signature: fmt.Sprintf("%s/%s/%s",
 						parentSig(child.Signature),
-						a.Name, attributeType),
+						a.Name.Local, attributeType),
 				}
 				child.Children = append(child.Children, attr)
 			}
@@ -302,7 +305,7 @@ func parentSig(sig string) string {
 }
 
 // Compare runs x-diff comparing algorithm on the provided arguments.
-// Original arugment is compared to edited and slice of differences is
+// Original argument is compared to edited and slice of differences is
 // returned.
 // It returns nil, nil if there is no difference.
 func Compare(original, edited io.Reader) ([]Delta, error) {
@@ -330,20 +333,14 @@ type NodePair struct {
 	Y *Node
 }
 
-func (np NodePair) String() string {
-	return fmt.Sprintf("(%s,%s)", np.X.Signature, np.Y.Signature)
-}
-
 // MinCostMatch is table of matched node pairs.
-type MinCostMatch map[NodePair][]NodePair
+type MinCostMatch map[NodePair]struct{}
 
 // Add idempotently adds new match to the given index.
-func (mcm MinCostMatch) Add(index, match NodePair) MinCostMatch {
-	pairs, ok := mcm[index]
+func (mcm MinCostMatch) Add(match NodePair) MinCostMatch {
+	_, ok := mcm[match]
 	if !ok {
-		mcm[index] = []NodePair{match}
-	} else if !pairIn(match, pairs) {
-		mcm[index] = append(pairs, match)
+		mcm[match] = struct{}{}
 	}
 	return mcm
 }
@@ -368,6 +365,14 @@ func (mcm MinCostMatch) HasY(n *Node) bool {
 	return false
 }
 
+func (mcm MinCostMatch) String() string {
+	out := ""
+	for pair := range mcm {
+		out += fmt.Sprintf("%s\n\n", pair)
+	}
+	return out
+}
+
 // DistTable maps pairs with costs.
 type DistTable map[NodePair]int
 
@@ -375,6 +380,11 @@ type DistTable map[NodePair]int
 func (dt DistTable) Has(pair NodePair) bool {
 	_, ok := dt[pair]
 	return ok
+}
+
+// Set updates cost for pair in the table.
+func (dt DistTable) Set(pair NodePair, cost int) {
+	dt[pair] = cost
 }
 
 func (dt DistTable) String() string {
@@ -394,14 +404,6 @@ func pairIn(pair NodePair, pairs []NodePair) bool {
 	return false
 }
 
-func (mcm MinCostMatch) String() string {
-	out := ""
-	for i, pairs := range mcm {
-		out += fmt.Sprintf("%s -> %s\n", i, pairs)
-	}
-	return out
-}
-
 // MinCostMatching finds minimum-cost matching between two trees.
 func MinCostMatching(oTree, eTree *Tree) (MinCostMatch, DistTable, error) {
 	minMatching := MinCostMatch{}
@@ -409,9 +411,10 @@ func MinCostMatching(oTree, eTree *Tree) (MinCostMatch, DistTable, error) {
 	var exclude []string
 	rootPair := NodePair{oTree.Root, eTree.Root}
 
-	if oTree.Root.Signature == oTree.Root.Signature {
-		minMatching.Add(rootPair, rootPair)
+	if oTree.Root.Signature != oTree.Root.Signature {
+		return minMatching, distTbl, nil
 	}
+	minMatching.Add(rootPair)
 
 	for _, oCh := range oTree.Root.Children {
 		for _, eCh := range eTree.Root.Children {
@@ -420,8 +423,7 @@ func MinCostMatching(oTree, eTree *Tree) (MinCostMatch, DistTable, error) {
 				// prefix matching.
 				sig := oCh.Signature[:len(oCh.Signature)-5]
 				exclude = append(exclude, sig)
-				pair := NodePair{oCh, eCh}
-				minMatching.Add(rootPair, pair)
+				minMatching.Add(NodePair{oCh, eCh})
 			}
 		}
 	}
@@ -477,11 +479,11 @@ func (cp costPairs) Len() int {
 func computeDist(x, y *Node, minMatching MinCostMatch, distTbl DistTable) {
 	pair := NodePair{x, y}
 	if x.IsLeaf && y.IsLeaf {
-		minMatching.Add(pair, pair)
+		minMatching.Add(pair)
 		if bytesEqual(x.Content, y.Content) {
-			distTbl[pair] = 0
+			distTbl.Set(pair, 0)
 		} else {
-			distTbl[pair] = 1
+			distTbl.Set(pair, 1)
 		}
 		return
 	}
@@ -495,9 +497,8 @@ func computeDist(x, y *Node, minMatching MinCostMatch, distTbl DistTable) {
 		groupY[ch.Signature] = append(groupY[ch.Signature], ch)
 	}
 	costs := costPairs{}
-	var mapped []NodePair
 	dist := 0
-	// Calculate distance for current pair.
+	// Calculate cost for current roots.
 	for sig, childrenX := range groupX {
 		if _, ok := groupY[sig]; ok {
 			for _, chX := range childrenX {
@@ -506,39 +507,38 @@ func computeDist(x, y *Node, minMatching MinCostMatch, distTbl DistTable) {
 					c, ok := distTbl[pair]
 					if !ok {
 						computeDist(chX, chY, minMatching, distTbl)
+						c = distTbl[pair]
 					}
 					costs = append(costs, costPair{NodePair: pair, Cost: c})
 				}
 			}
-			sort.Sort(costs)
+			if len(costs) > 1 {
+				sort.Sort(costs)
+			}
 			for _, cost := range costs {
 				if contains(cost.X, childrenX) && contains(cost.Y, groupY[sig]) {
-					// Handle mapped nodes.
+					if !minMatching.HasX(cost.X) && !minMatching.HasY(cost.Y) {
+						minMatching.Add(cost.NodePair)
+					}
+					// Calculate cost for mapped nodes.
 					d, ok := distTbl[cost.NodePair]
-					if !ok {
+					if ok {
 						dist += d
 						continue
 					}
-					// Delete + Insert cost of all sub nodes.
-					dist += countTotal(cost.X) + countTotal(cost.Y)
+					// Delete + Insert cost.
+					dist++
+					continue
 				}
 				// Handle unmapped nodes.
-				// Delete cost of all sub nodes.
-				dist += countTotal(cost.X)
-				// Insert cost of all sub nodes.
-				dist += countTotal(cost.Y)
+				// Delete cost.
+				dist++
+				// Insert cost.
+				dist++
 			}
 		}
 	}
-	distTbl[pair] = dist
-	minMatching.Add(pair, pair)
-	for _, p := range mapped {
-		if maps, ok := minMatching[p]; ok {
-			for _, m := range maps {
-				minMatching.Add(pair, m)
-			}
-		}
-	}
+	distTbl.Set(pair, dist)
 }
 
 func countTotal(n *Node) int {
@@ -600,12 +600,14 @@ func EditScript(oRoot, eRoot *Node, minCostM MinCostMatch, distTbl DistTable) []
 				}
 				script = append(script, EditScript(x, y, minCostM, distTbl)...)
 			}
-			if !minCostM.HasY(y) {
-				script = append(script, Delta{Op: Insert, Desc: y.String()})
-			}
 		}
 		if !minCostM.HasX(x) {
 			script = append(script, Delta{Op: Delete, Desc: x.String()})
+		}
+	}
+	for _, y := range eRoot.Children {
+		if !minCostM.HasY(y) {
+			script = append(script, Delta{Op: Insert, Desc: y.String()})
 		}
 	}
 	return script
