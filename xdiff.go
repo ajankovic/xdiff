@@ -1,6 +1,7 @@
 package xdiff
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/xml"
@@ -54,8 +55,9 @@ const (
 // Delta is a unit of change to the original doc that would change it into
 // edited document.
 type Delta struct {
-	Op   Operation
-	Desc string
+	Op     Operation
+	Node   *Node
+	Update *Node
 }
 
 // CompareStrings is just helper to compare strings instead of readers.
@@ -81,21 +83,20 @@ func (n *Node) IsRoot() bool {
 
 func (n *Node) String() string {
 	hash := hex.EncodeToString(n.Hash)
-	leaf := ""
 	child := ""
 	if n.IsLeaf {
-		leaf = "leaf"
-	} else {
+		child = string(n.Content)
+	} else if n.Children[0].Name.Local == "" {
 		child = string(n.Children[0].Content)
 	}
 	if n.Name.Local != "" {
-		return fmt.Sprintf("%s:%s [%s] {%s}",
-			n.Name.Local, child, n.Signature, hash)
+		return fmt.Sprintf("[%s] %s:%s {%s}",
+			n.Signature, n.Name.Local, child, hash)
 	}
 	if n.Content != nil {
-		return fmt.Sprintf("%s:%q [%s] {%s}", leaf, n.Content, n.Signature, hash)
+		return fmt.Sprintf("[%s] %q {%s}", n.Signature, n.Content, hash)
 	}
-	return fmt.Sprintf("ROOT [%s] {%s}", n.Signature, hash)
+	return fmt.Sprintf("[%s] ROOT {%s}", n.Signature, hash)
 }
 
 // Tree groups needed elements for comparing documents.
@@ -143,12 +144,33 @@ func (h hashes) Len() int {
 	return len(h)
 }
 
+type buffer struct {
+	bytes.Buffer
+	err error
+	n   int
+}
+
+func (b *buffer) Concat(strs ...string) *buffer {
+	for _, s := range strs {
+		if b.err == nil {
+			b.n, b.err = b.Buffer.WriteString(s)
+		}
+	}
+	return b
+}
+
+func (b *buffer) Error() error {
+	return b.err
+}
+
 // ParseDoc parses xml and returns root node. Each node in the
 // parsed tree is hashed.
 func ParseDoc(r io.Reader) (*Tree, error) {
 	dec := xml.NewDecoder(r)
 	current := &Node{Signature: "/"}
 	var leafs []*Node
+	var buff buffer
+	h := sha1.New()
 loop:
 	for {
 		tok, err := dec.Token()
@@ -160,23 +182,32 @@ loop:
 		}
 		switch el := xml.CopyToken(tok).(type) {
 		case xml.StartElement:
+			buff.Concat(parentSig(current.Signature), "/", el.Name.Local, "/", elementType)
+			if buff.Error() != nil {
+				return nil, buff.Error()
+			}
 			child := &Node{
-				Name:   el.Name,
-				Parent: current,
-				IsLeaf: true,
-				Signature: fmt.Sprintf("%s/%s/%s",
-					parentSig(current.Signature),
-					el.Name.Local, elementType),
+				Name:      el.Name,
+				Parent:    current,
+				IsLeaf:    true,
+				Signature: buff.String(),
 			}
 			for _, a := range el.Attr {
-				attr := &Node{
-					Name:    a.Name,
-					Content: []byte(a.Value),
-					IsLeaf:  true,
-					Signature: fmt.Sprintf("%s/%s/%s",
-						parentSig(child.Signature),
-						a.Name.Local, attributeType),
+				buff.Reset()
+				buff.Concat(parentSig(child.Signature), "/", a.Name.Local, "/", attributeType)
+				if buff.Error() != nil {
+					return nil, buff.Error()
 				}
+				attr := &Node{
+					Name:      a.Name,
+					Content:   []byte(a.Value),
+					IsLeaf:    true,
+					Signature: buff.String(),
+				}
+				io.WriteString(h, attributeType)
+				io.WriteString(h, a.Name.Local)
+				h.Write(attr.Content)
+				attr.Hash = h.Sum(nil)
 				child.Children = append(child.Children, attr)
 			}
 			current.IsLeaf = false
@@ -185,7 +216,6 @@ loop:
 		case xml.EndElement:
 			// Compute node hash as sum of all children
 			// and node name.
-			h := sha1.New()
 			_, err := io.WriteString(h, elementType)
 			if err != nil {
 				return nil, err
@@ -196,22 +226,26 @@ loop:
 			if err != nil {
 				return nil, err
 			}
-			// Sorting hashes to ensure unordered model.
-			var hs hashes
-			for _, n := range current.Children {
-				hs = append(hs, n.Hash)
-			}
-			sort.Sort(hs)
-			for _, hash := range hs {
-				_, err := h.Write(hash)
-				if err != nil {
-					return nil, err
+			if len(current.Children) > 0 {
+				// Sorting hashes to ensure unordered model.
+				var hs hashes
+				for _, n := range current.Children {
+					hs = append(hs, n.Hash)
 				}
-			}
-			current.Hash = h.Sum(nil)
-			if current.IsLeaf {
+				if len(current.Children) > 1 {
+					sort.Sort(hs)
+				}
+				for _, hash := range hs {
+					_, err := h.Write(hash)
+					if err != nil {
+						return nil, err
+					}
+				}
+			} else {
+				current.IsLeaf = true
 				leafs = append(leafs, current)
 			}
+			current.Hash = h.Sum(nil)
 			if current.Parent == nil {
 				break loop
 			}
@@ -222,14 +256,12 @@ loop:
 				continue
 			}
 			child := &Node{
-				Parent:  current,
-				IsLeaf:  true,
-				Content: content,
-				Signature: fmt.Sprintf("%s/%s",
-					parentSig(current.Signature), textType),
+				Parent:    current,
+				IsLeaf:    true,
+				Content:   content,
+				Signature: buff.Concat(parentSig(current.Signature), "/", textType).String(),
 			}
 			leafs = append(leafs, child)
-			h := sha1.New()
 			io.WriteString(h, textType)
 			h.Write(child.Content)
 			child.Hash = h.Sum(nil)
@@ -237,14 +269,12 @@ loop:
 			current.Children = append(current.Children, child)
 		case xml.Comment:
 			child := &Node{
-				Parent:  current,
-				IsLeaf:  true,
-				Content: []byte(el),
-				Signature: fmt.Sprintf("%s/%s",
-					parentSig(current.Signature), commentType),
+				Parent:    current,
+				IsLeaf:    true,
+				Content:   []byte(el),
+				Signature: buff.Concat(parentSig(current.Signature), "/", commentType).String(),
 			}
 			leafs = append(leafs, child)
-			h := sha1.New()
 			io.WriteString(h, commentType)
 			h.Write(child.Content)
 			child.Hash = h.Sum(nil)
@@ -252,14 +282,12 @@ loop:
 			current.Children = append(current.Children, child)
 		case xml.Directive:
 			child := &Node{
-				Parent:  current,
-				IsLeaf:  true,
-				Content: []byte(el),
-				Signature: fmt.Sprintf("%s/%s",
-					parentSig(current.Signature), directiveType),
+				Parent:    current,
+				IsLeaf:    true,
+				Content:   []byte(el),
+				Signature: buff.Concat(parentSig(current.Signature), "/", directiveType).String(),
 			}
 			leafs = append(leafs, child)
-			h := sha1.New()
 			io.WriteString(h, directiveType)
 			h.Write(child.Content)
 			child.Hash = h.Sum(nil)
@@ -267,23 +295,22 @@ loop:
 			current.Children = append(current.Children, child)
 		case xml.ProcInst:
 			child := &Node{
-				Parent:  current,
-				IsLeaf:  true,
-				Content: append([]byte(el.Target), el.Inst...),
-				Signature: fmt.Sprintf("%s/%s/%s",
-					parentSig(current.Signature),
-					el.Target, procInstType),
+				Parent:    current,
+				IsLeaf:    true,
+				Content:   append([]byte(el.Target), el.Inst...),
+				Signature: buff.Concat(parentSig(current.Signature), "/", el.Target, "/", procInstType).String(),
 			}
 			leafs = append(leafs, child)
-			h := sha1.New()
 			io.WriteString(h, procInstType)
 			h.Write(child.Content)
 			child.Hash = h.Sum(nil)
 			current.IsLeaf = false
 			current.Children = append(current.Children, child)
 		}
+		buff.Reset()
+		h.Reset()
 	}
-	h := sha1.New()
+	h.Reset()
 	for _, n := range current.Children {
 		_, err := h.Write(n.Hash)
 		if err != nil {
@@ -304,10 +331,10 @@ func parentSig(sig string) string {
 	return sig
 }
 
-// Compare runs x-diff comparing algorithm on the provided arguments.
-// Original argument is compared to edited and slice of differences is
+// Compare runs X-Diff comparing algorithm on the provided arguments.
+// Original reader is compared to edited and slice of deltas is
 // returned.
-// It returns nil, nil if there is no difference.
+// Compare returns nil, nil if there is no difference.
 func Compare(original, edited io.Reader) ([]Delta, error) {
 	oTree, err := ParseDoc(original)
 	if err != nil {
@@ -576,8 +603,8 @@ func EditScript(oRoot, eRoot *Node, minCostM MinCostMatch, distTbl DistTable) []
 	_, ok := minCostM[rootPair]
 	if !ok {
 		return []Delta{
-			Delta{Op: DeleteSubtree, Desc: oRoot.String()},
-			Delta{Op: InsertSubtree, Desc: eRoot.String()},
+			Delta{Op: DeleteSubtree, Node: oRoot},
+			Delta{Op: InsertSubtree, Node: eRoot},
 		}
 	}
 	if distTbl[rootPair] == 0 {
@@ -595,19 +622,27 @@ func EditScript(oRoot, eRoot *Node, minCostM MinCostMatch, distTbl DistTable) []
 					if distTbl[pair] == 0 {
 						continue
 					}
-					script = append(script, Delta{Op: Update, Desc: fmt.Sprintf("%s -> %s", x, y)})
+					script = append(script, Delta{Op: Update, Node: x, Update: y})
 					continue
 				}
 				script = append(script, EditScript(x, y, minCostM, distTbl)...)
 			}
 		}
 		if !minCostM.HasX(x) {
-			script = append(script, Delta{Op: Delete, Desc: x.String()})
+			if x.IsLeaf {
+				script = append(script, Delta{Op: Delete, Node: x})
+				continue
+			}
+			script = append(script, Delta{Op: DeleteSubtree, Node: x})
 		}
 	}
 	for _, y := range eRoot.Children {
 		if !minCostM.HasY(y) {
-			script = append(script, Delta{Op: Insert, Desc: y.String()})
+			if y.IsLeaf {
+				script = append(script, Delta{Op: Insert, Node: y})
+				continue
+			}
+			script = append(script, Delta{Op: InsertSubtree, Node: y})
 		}
 	}
 	return script

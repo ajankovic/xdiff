@@ -16,7 +16,10 @@ type plainTextEncoder struct {
 
 func (pte *plainTextEncoder) Encode(deltas []Delta) error {
 	for _, d := range deltas {
-		fmt.Fprintf(pte.w, "%s('%s')\n", d.Op, d.Desc)
+		if d.Op == Update {
+			fmt.Fprintf(pte.w, "%s('%s'->'%s')\n", d.Op, d.Node, d.Update)
+		}
+		fmt.Fprintf(pte.w, "%s('%s')\n", d.Op, d.Node)
 	}
 	return nil
 }

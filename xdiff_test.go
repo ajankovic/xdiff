@@ -1,6 +1,7 @@
 package xdiff
 
 import (
+	"encoding/xml"
 	"strings"
 	"testing"
 )
@@ -30,6 +31,9 @@ var (
 		<!--Comment-->
         <scopes>Full</scopes>
         <scopes>Basic</scopes>
+        <configurable>
+            <empty></empty>
+        </configurable>
     </oauthConfig>
 </ConnectedApp>
 `
@@ -53,6 +57,16 @@ func TestParseDoc(t *testing.T) {
 			}
 		}
 	}
+	attr := tree.Root.Children[1].Children[0]
+	if attr.Name.Local != "xmlns" {
+		t.Errorf("ConnectedApp xmlns attribute has incorrect name %s", attr.Name.Local)
+	}
+	if string(attr.Content) != "http://soap.sforce.com/2006/04/metadata" {
+		t.Errorf("ConnectedApp xmlns attribute has incorrect content %q", attr.Content)
+	}
+	if attr.Signature != "//ConnectedApp/xmlns/attr" {
+		t.Errorf("ConnectedApp xmlns attribute has incorrect signature %s", attr.Signature)
+	}
 }
 
 func TestCompare(t *testing.T) {
@@ -63,7 +77,89 @@ func TestCompare(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(deltas) != 5 {
+	if len(deltas) != 6 {
 		t.Errorf("Incorrect number of deltas, got %d.", len(deltas))
+	}
+	opCount := make(map[Operation]int)
+	for _, d := range deltas {
+		if c, ok := opCount[d.Op]; ok {
+			opCount[d.Op] = c + 1
+		} else {
+			opCount[d.Op] = 1
+		}
+	}
+	if opCount[InsertSubtree] != 1 {
+		t.Errorf("Incorrect number of InsertSubtree deltas, got %d.", opCount[InsertSubtree])
+	}
+}
+
+func BenchmarkParseDocOneElement(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		doc, err := ParseDoc(strings.NewReader("<xml>innertext</xml>"))
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = doc
+	}
+}
+
+func BenchmarkParseDocTwoElements(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		doc, err := ParseDoc(strings.NewReader("<xml><xml>innertext</xml></xml>"))
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = doc
+	}
+}
+
+func BenchmarkParseDocFourElements(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		doc, err := ParseDoc(strings.NewReader("<xml><xml><xml><xml>innertext</xml></xml></xml></xml>"))
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = doc
+	}
+}
+
+func BenchmarkParseDocOriginal(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		doc, err := ParseDoc(strings.NewReader(originalDoc))
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = doc
+	}
+}
+
+func BenchmarkPlainXmlParse(b *testing.B) {
+	type Node struct {
+		XMLName xml.Name
+		Attrs   []xml.Attr `xml:"-"`
+		Content []byte     `xml:",innerxml"`
+		Nodes   []Node     `xml:",any"`
+	}
+	var node Node
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		err := xml.Unmarshal([]byte(originalDoc), &node)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	_ = node
+}
+
+func BenchmarkCompare(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		deltas, err := Compare(
+			strings.NewReader(originalDoc),
+			strings.NewReader(editedDoc),
+		)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = deltas
 	}
 }
