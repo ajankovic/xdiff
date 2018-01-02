@@ -67,13 +67,13 @@ func CompareStrings(original, edited string) ([]Delta, error) {
 
 // Node coresponds to one xml node.
 type Node struct {
-	Name      xml.Name
-	Content   []byte
-	Parent    *Node
-	Children  []*Node
-	Hash      []byte
-	Signature string
-	IsLeaf    bool
+	Parent      *Node
+	LastChild   *Node
+	PrevSibling *Node
+	Name        string
+	Content     []byte
+	Hash        []byte
+	Signature   string
 }
 
 // IsRoot determines if node is root node of the tree.
@@ -84,14 +84,14 @@ func (n *Node) IsRoot() bool {
 func (n *Node) String() string {
 	hash := hex.EncodeToString(n.Hash)
 	child := ""
-	if n.IsLeaf {
+	if n.LastChild == nil {
 		child = string(n.Content)
-	} else if n.Children[0].Name.Local == "" {
-		child = string(n.Children[0].Content)
+	} else if n.LastChild.Name == "" {
+		child = string(n.LastChild.Content)
 	}
-	if n.Name.Local != "" {
+	if n.Name != "" {
 		return fmt.Sprintf("[%s] %s:%s {%s}",
-			n.Signature, n.Name.Local, child, hash)
+			n.Signature, n.Name, child, hash)
 	}
 	if n.Content != nil {
 		return fmt.Sprintf("[%s] %q {%s}", n.Signature, n.Content, hash)
@@ -115,9 +115,11 @@ func (t *Tree) String() string {
 }
 
 func walk(n *Node, level int, f func(n *Node, level int)) {
-	f(n, level)
-	for _, ch := range n.Children {
-		walk(ch, level+1, f)
+	for sbl := n; sbl != nil; sbl = sbl.PrevSibling {
+		f(sbl, level)
+		if sbl.LastChild != nil {
+			walk(sbl.LastChild, level+1, f)
+		}
 	}
 }
 
@@ -150,17 +152,26 @@ type buffer struct {
 	n   int
 }
 
-func (b *buffer) Concat(strs ...string) *buffer {
+func (b *buffer) Concat(strs ...string) (n int, err error) {
 	for _, s := range strs {
 		if b.err == nil {
 			b.n, b.err = b.Buffer.WriteString(s)
 		}
 	}
-	return b
+	return b.n, b.err
 }
 
 func (b *buffer) Error() error {
 	return b.err
+}
+
+func addChild(parent, child *Node) {
+	if parent.LastChild == nil {
+		parent.LastChild = child
+	} else {
+		child.PrevSibling = parent.LastChild
+		parent.LastChild = child
+	}
 }
 
 // ParseDoc parses xml and returns root node. Each node in the
@@ -180,59 +191,63 @@ loop:
 		if tok == nil {
 			break
 		}
-		switch el := xml.CopyToken(tok).(type) {
+		switch el := tok.(type) {
 		case xml.StartElement:
-			buff.Concat(parentSig(current.Signature), "/", el.Name.Local, "/", elementType)
-			if buff.Error() != nil {
-				return nil, buff.Error()
+			_, err := buff.Concat(parentSig(current.Signature), "/", el.Name.Local, "/", elementType)
+			if err != nil {
+				return nil, err
 			}
 			child := &Node{
-				Name:      el.Name,
+				Name:      el.Name.Local,
 				Parent:    current,
-				IsLeaf:    true,
 				Signature: buff.String(),
 			}
 			for _, a := range el.Attr {
 				buff.Reset()
-				buff.Concat(parentSig(child.Signature), "/", a.Name.Local, "/", attributeType)
-				if buff.Error() != nil {
-					return nil, buff.Error()
+				_, err := buff.Concat(parentSig(child.Signature), "/", a.Name.Local, "/", attributeType)
+				if err != nil {
+					return nil, err
 				}
 				attr := &Node{
-					Name:      a.Name,
+					Name:      a.Name.Local,
 					Content:   []byte(a.Value),
-					IsLeaf:    true,
 					Signature: buff.String(),
 				}
-				io.WriteString(h, attributeType)
-				io.WriteString(h, a.Name.Local)
-				h.Write(attr.Content)
+				_, err = io.WriteString(h, attributeType)
+				if err != nil {
+					return nil, err
+				}
+				_, err = io.WriteString(h, attr.Name)
+				if err != nil {
+					return nil, err
+				}
+				_, err = h.Write(attr.Content)
+				if err != nil {
+					return nil, err
+				}
 				attr.Hash = h.Sum(nil)
-				child.Children = append(child.Children, attr)
+				addChild(child, attr)
 			}
-			current.IsLeaf = false
-			current.Children = append(current.Children, child)
+			addChild(current, child)
 			current = child
 		case xml.EndElement:
 			// Compute node hash as sum of all children
-			// and node name.
+			// with node type and name.
 			_, err := io.WriteString(h, elementType)
 			if err != nil {
 				return nil, err
 			}
-			// We will include namespace in the name.
-			_, err = io.WriteString(h,
-				current.Name.Space+current.Name.Local)
+			_, err = io.WriteString(h, current.Name)
 			if err != nil {
 				return nil, err
 			}
-			if len(current.Children) > 0 {
-				// Sorting hashes to ensure unordered model.
+			if current.LastChild != nil {
 				var hs hashes
-				for _, n := range current.Children {
-					hs = append(hs, n.Hash)
+				for sbl := current.LastChild; sbl != nil; sbl = sbl.PrevSibling {
+					hs = append(hs, sbl.Hash)
 				}
-				if len(current.Children) > 1 {
+				if len(hs) > 1 {
+					// Sorting hashes to ensure unordered model.
 					sort.Sort(hs)
 				}
 				for _, hash := range hs {
@@ -242,77 +257,113 @@ loop:
 					}
 				}
 			} else {
-				current.IsLeaf = true
 				leafs = append(leafs, current)
 			}
 			current.Hash = h.Sum(nil)
 			if current.Parent == nil {
+				h.Reset()
 				break loop
 			}
 			current = current.Parent
 		case xml.CharData:
-			content := []byte(el)
+			content := make([]byte, len(el))
+			copy(content, el)
 			if strings.TrimSpace(string(content)) == "" {
 				continue
 			}
+			_, err := buff.Concat(parentSig(current.Signature), "/", textType)
+			if err != nil {
+				return nil, err
+			}
 			child := &Node{
 				Parent:    current,
-				IsLeaf:    true,
 				Content:   content,
-				Signature: buff.Concat(parentSig(current.Signature), "/", textType).String(),
+				Signature: buff.String(),
 			}
 			leafs = append(leafs, child)
-			io.WriteString(h, textType)
-			h.Write(child.Content)
+			_, err = io.WriteString(h, textType)
+			if err != nil {
+				return nil, err
+			}
+			_, err = h.Write(child.Content)
+			if err != nil {
+				return nil, err
+			}
 			child.Hash = h.Sum(nil)
-			current.IsLeaf = false
-			current.Children = append(current.Children, child)
+			addChild(current, child)
 		case xml.Comment:
+			_, err := buff.Concat(parentSig(current.Signature), "/", commentType)
+			if err != nil {
+				return nil, err
+			}
+			content := make([]byte, len(el))
+			copy(content, el)
 			child := &Node{
 				Parent:    current,
-				IsLeaf:    true,
-				Content:   []byte(el),
-				Signature: buff.Concat(parentSig(current.Signature), "/", commentType).String(),
+				Content:   content,
+				Signature: buff.String(),
 			}
 			leafs = append(leafs, child)
-			io.WriteString(h, commentType)
-			h.Write(child.Content)
+			_, err = io.WriteString(h, commentType)
+			if err != nil {
+				return nil, err
+			}
+			_, err = h.Write(child.Content)
+			if err != nil {
+				return nil, err
+			}
 			child.Hash = h.Sum(nil)
-			current.IsLeaf = false
-			current.Children = append(current.Children, child)
+			addChild(current, child)
 		case xml.Directive:
+			_, err := buff.Concat(parentSig(current.Signature), "/", directiveType)
+			if err != nil {
+				return nil, err
+			}
+			content := make([]byte, len(el))
+			copy(content, el)
 			child := &Node{
 				Parent:    current,
-				IsLeaf:    true,
-				Content:   []byte(el),
-				Signature: buff.Concat(parentSig(current.Signature), "/", directiveType).String(),
+				Content:   content,
+				Signature: buff.String(),
 			}
 			leafs = append(leafs, child)
-			io.WriteString(h, directiveType)
-			h.Write(child.Content)
+			_, err = io.WriteString(h, directiveType)
+			if err != nil {
+				return nil, err
+			}
+			_, err = h.Write(child.Content)
+			if err != nil {
+				return nil, err
+			}
 			child.Hash = h.Sum(nil)
-			current.IsLeaf = false
-			current.Children = append(current.Children, child)
+			addChild(current, child)
 		case xml.ProcInst:
+			_, err := buff.Concat(parentSig(current.Signature), "/", el.Target, "/", procInstType)
+			if err != nil {
+				return nil, err
+			}
 			child := &Node{
 				Parent:    current,
-				IsLeaf:    true,
 				Content:   append([]byte(el.Target), el.Inst...),
-				Signature: buff.Concat(parentSig(current.Signature), "/", el.Target, "/", procInstType).String(),
+				Signature: buff.String(),
 			}
 			leafs = append(leafs, child)
-			io.WriteString(h, procInstType)
-			h.Write(child.Content)
+			_, err = io.WriteString(h, procInstType)
+			if err != nil {
+				return nil, err
+			}
+			_, err = h.Write(child.Content)
+			if err != nil {
+				return nil, err
+			}
 			child.Hash = h.Sum(nil)
-			current.IsLeaf = false
-			current.Children = append(current.Children, child)
+			addChild(current, child)
 		}
 		buff.Reset()
 		h.Reset()
 	}
-	h.Reset()
-	for _, n := range current.Children {
-		_, err := h.Write(n.Hash)
+	for sbl := current.LastChild; sbl != nil; sbl = sbl.PrevSibling {
+		_, err := h.Write(sbl.Hash)
 		if err != nil {
 			return nil, err
 		}
@@ -443,9 +494,9 @@ func MinCostMatching(oTree, eTree *Tree) (MinCostMatch, DistTable, error) {
 	}
 	minMatching.Add(rootPair)
 
-	for _, oCh := range oTree.Root.Children {
-		for _, eCh := range eTree.Root.Children {
-			if !oCh.IsLeaf && !eCh.IsLeaf && bytesEqual(oCh.Hash, eCh.Hash) {
+	for oCh := oTree.Root.LastChild; oCh != nil; oCh = oCh.PrevSibling {
+		for eCh := eTree.Root.LastChild; eCh != nil; eCh = eCh.PrevSibling {
+			if oCh.LastChild != nil && eCh.LastChild != nil && bytesEqual(oCh.Hash, eCh.Hash) {
 				// Remove trailing type from the signature for easier
 				// prefix matching.
 				sig := oCh.Signature[:len(oCh.Signature)-5]
@@ -505,7 +556,7 @@ func (cp costPairs) Len() int {
 
 func computeDist(x, y *Node, minMatching MinCostMatch, distTbl DistTable) {
 	pair := NodePair{x, y}
-	if x.IsLeaf && y.IsLeaf {
+	if x.LastChild == nil && y.LastChild == nil {
 		minMatching.Add(pair)
 		if bytesEqual(x.Content, y.Content) {
 			distTbl.Set(pair, 0)
@@ -517,10 +568,10 @@ func computeDist(x, y *Node, minMatching MinCostMatch, distTbl DistTable) {
 	// Group children of the non-leaf nodes by signature.
 	groupX := make(map[string][]*Node)
 	groupY := make(map[string][]*Node)
-	for _, ch := range x.Children {
+	for ch := x.LastChild; ch != nil; ch = ch.PrevSibling {
 		groupX[ch.Signature] = append(groupX[ch.Signature], ch)
 	}
-	for _, ch := range y.Children {
+	for ch := y.LastChild; ch != nil; ch = ch.PrevSibling {
 		groupY[ch.Signature] = append(groupY[ch.Signature], ch)
 	}
 	costs := costPairs{}
@@ -568,14 +619,6 @@ func computeDist(x, y *Node, minMatching MinCostMatch, distTbl DistTable) {
 	distTbl.Set(pair, dist)
 }
 
-func countTotal(n *Node) int {
-	total := 0
-	walk(n, 0, func(n *Node, level int) {
-		total++
-	})
-	return total
-}
-
 func contains(n *Node, nodes []*Node) bool {
 	for _, x := range nodes {
 		if x == n {
@@ -611,14 +654,14 @@ func EditScript(oRoot, eRoot *Node, minCostM MinCostMatch, distTbl DistTable) []
 		return nil
 	}
 	var script []Delta
-	for _, x := range oRoot.Children {
-		for _, y := range eRoot.Children {
+	for x := oRoot.LastChild; x != nil; x = x.PrevSibling {
+		for y := eRoot.LastChild; y != nil; y = y.PrevSibling {
 			if bytesEqual(x.Hash, y.Hash) {
 				continue
 			}
 			pair := NodePair{x, y}
 			if _, ok := minCostM[pair]; ok {
-				if x.IsLeaf && y.IsLeaf {
+				if x.LastChild == nil && y.LastChild == nil {
 					if distTbl[pair] == 0 {
 						continue
 					}
@@ -629,16 +672,16 @@ func EditScript(oRoot, eRoot *Node, minCostM MinCostMatch, distTbl DistTable) []
 			}
 		}
 		if !minCostM.HasX(x) {
-			if x.IsLeaf {
+			if x.LastChild == nil {
 				script = append(script, Delta{Op: Delete, Node: x})
 				continue
 			}
 			script = append(script, Delta{Op: DeleteSubtree, Node: x})
 		}
 	}
-	for _, y := range eRoot.Children {
+	for y := eRoot.LastChild; y != nil; y = y.PrevSibling {
 		if !minCostM.HasY(y) {
-			if y.IsLeaf {
+			if y.LastChild == nil {
 				script = append(script, Delta{Op: Insert, Node: y})
 				continue
 			}

@@ -57,9 +57,9 @@ func TestParseDoc(t *testing.T) {
 			}
 		}
 	}
-	attr := tree.Root.Children[1].Children[0]
-	if attr.Name.Local != "xmlns" {
-		t.Errorf("ConnectedApp xmlns attribute has incorrect name %s", attr.Name.Local)
+	attr := tree.Root.LastChild.LastChild.PrevSibling.PrevSibling.PrevSibling
+	if attr.Name != "xmlns" {
+		t.Errorf("ConnectedApp xmlns attribute has incorrect name %s", attr.Name)
 	}
 	if string(attr.Content) != "http://soap.sforce.com/2006/04/metadata" {
 		t.Errorf("ConnectedApp xmlns attribute has incorrect content %q", attr.Content)

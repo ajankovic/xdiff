@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/ajankovic/xdiff"
 )
@@ -19,6 +20,7 @@ func main() {
 	if originalFname == "" || editedFname == "" {
 		fail("File names of both original and edited documents are required.")
 	}
+	start := time.Now()
 	oFile, err := os.Open(originalFname)
 	if err != nil {
 		fail("Failed to open original file %s error: %v",
@@ -33,6 +35,7 @@ func main() {
 	if err != nil {
 		fail("Failed to compare files error: %v", err.Error())
 	}
+	fmt.Printf("Comparing Time: %s\n", time.Since(start))
 	enc := xdiff.PlainTextEncoder(os.Stdout)
 	if err := enc.Encode(diff); err != nil {
 		fail("Failed to generate output error: %v", err.Error())
