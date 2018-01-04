@@ -47,15 +47,18 @@ func TestParseDoc(t *testing.T) {
 	if !tree.Root.IsRoot() {
 		t.Error("Not root.")
 	}
-	if len(tree.Leafs) != 9 {
-		t.Errorf("Incorrect number of leafs, got %d.", len(tree.Leafs))
-	}
-	for i, leaf := range tree.Leafs {
-		if i == 2 {
-			if string(leaf.Content) != "WooCommerce" {
-				t.Errorf("Third leaf incorrect, got %s.", leaf.Content)
-			}
+	leafs := 0
+	walk(tree.Root, 0, func(n *Node, l int) {
+		if n.LastChild == nil {
+			leafs++
 		}
+	})
+	if leafs != 10 {
+		t.Errorf("Incorrect number of leafs, got %d.", leafs)
+	}
+	content := string(tree.Root.LastChild.LastChild.PrevSibling.LastChild.Content)
+	if content != "WooCommerce" {
+		t.Errorf("Third leaf incorrect, got %s.", content)
 	}
 	attr := tree.Root.LastChild.LastChild.PrevSibling.PrevSibling.PrevSibling
 	if attr.Name != "xmlns" {

@@ -15,9 +15,13 @@ type plainTextEncoder struct {
 }
 
 func (pte *plainTextEncoder) Encode(deltas []Delta) error {
+	if len(deltas) == 0 {
+		fmt.Fprint(pte.w, "No difference.\n")
+	}
 	for _, d := range deltas {
 		if d.Op == Update {
 			fmt.Fprintf(pte.w, "%s('%s'->'%s')\n", d.Op, d.Node, d.Update)
+			continue
 		}
 		fmt.Fprintf(pte.w, "%s('%s')\n", d.Op, d.Node)
 	}

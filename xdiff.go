@@ -101,8 +101,7 @@ func (n *Node) String() string {
 
 // Tree groups needed elements for comparing documents.
 type Tree struct {
-	Root  *Node
-	Leafs []*Node
+	Root *Node
 }
 
 func (t *Tree) String() string {
@@ -177,12 +176,13 @@ func addChild(parent, child *Node) {
 // ParseDoc parses xml and returns root node. Each node in the
 // parsed tree is hashed.
 func ParseDoc(r io.Reader) (*Tree, error) {
+	t := &Tree{
+		Root: &Node{Signature: "/"},
+	}
 	dec := xml.NewDecoder(r)
-	current := &Node{Signature: "/"}
-	var leafs []*Node
+	current := t.Root
 	var buff buffer
 	h := sha1.New()
-loop:
 	for {
 		tok, err := dec.Token()
 		if err != nil && err != io.EOF {
@@ -256,14 +256,8 @@ loop:
 						return nil, err
 					}
 				}
-			} else {
-				leafs = append(leafs, current)
 			}
 			current.Hash = h.Sum(nil)
-			if current.Parent == nil {
-				h.Reset()
-				break loop
-			}
 			current = current.Parent
 		case xml.CharData:
 			content := make([]byte, len(el))
@@ -280,7 +274,6 @@ loop:
 				Content:   content,
 				Signature: buff.String(),
 			}
-			leafs = append(leafs, child)
 			_, err = io.WriteString(h, textType)
 			if err != nil {
 				return nil, err
@@ -303,7 +296,6 @@ loop:
 				Content:   content,
 				Signature: buff.String(),
 			}
-			leafs = append(leafs, child)
 			_, err = io.WriteString(h, commentType)
 			if err != nil {
 				return nil, err
@@ -326,7 +318,6 @@ loop:
 				Content:   content,
 				Signature: buff.String(),
 			}
-			leafs = append(leafs, child)
 			_, err = io.WriteString(h, directiveType)
 			if err != nil {
 				return nil, err
@@ -338,6 +329,9 @@ loop:
 			child.Hash = h.Sum(nil)
 			addChild(current, child)
 		case xml.ProcInst:
+			if el.Target == "xml" {
+				continue
+			}
 			_, err := buff.Concat(parentSig(current.Signature), "/", el.Target, "/", procInstType)
 			if err != nil {
 				return nil, err
@@ -347,7 +341,6 @@ loop:
 				Content:   append([]byte(el.Target), el.Inst...),
 				Signature: buff.String(),
 			}
-			leafs = append(leafs, child)
 			_, err = io.WriteString(h, procInstType)
 			if err != nil {
 				return nil, err
@@ -369,10 +362,7 @@ loop:
 		}
 	}
 	current.Hash = h.Sum(nil)
-	return &Tree{
-		Root:  current,
-		Leafs: leafs,
-	}, nil
+	return t, nil
 }
 
 func parentSig(sig string) string {
@@ -486,45 +476,54 @@ func pairIn(pair NodePair, pairs []NodePair) bool {
 func MinCostMatching(oTree, eTree *Tree) (MinCostMatch, DistTable, error) {
 	minMatching := MinCostMatch{}
 	distTbl := DistTable{}
-	var exclude []string
+	// Add document roots to the min matching table.
 	rootPair := NodePair{oTree.Root, eTree.Root}
-
-	if oTree.Root.Signature != oTree.Root.Signature {
+	minMatching.Add(rootPair)
+	// If there is only one child node per document root use them as roots.
+	if rootPair.X.LastChild.PrevSibling == nil && rootPair.Y.LastChild.PrevSibling == nil {
+		rootPair.X = oTree.Root.LastChild
+		rootPair.Y = eTree.Root.LastChild
+	}
+	if rootPair.X.Signature != rootPair.Y.Signature {
 		return minMatching, distTbl, nil
 	}
 	minMatching.Add(rootPair)
 
-	for oCh := oTree.Root.LastChild; oCh != nil; oCh = oCh.PrevSibling {
-		for eCh := eTree.Root.LastChild; eCh != nil; eCh = eCh.PrevSibling {
-			if oCh.LastChild != nil && eCh.LastChild != nil && bytesEqual(oCh.Hash, eCh.Hash) {
-				// Remove trailing type from the signature for easier
-				// prefix matching.
-				sig := oCh.Signature[:len(oCh.Signature)-5]
-				exclude = append(exclude, sig)
-				minMatching.Add(NodePair{oCh, eCh})
-			}
+	excludeEqual(rootPair.X, rootPair.Y, 2)
+
+	// Find all leaf nodes.
+	var n1 []*Node
+	var n2 []*Node
+	walk(rootPair.X, 0, func(n *Node, l int) {
+		if n.LastChild == nil {
+			n1 = append(n1, n)
 		}
-	}
-	n1 := oTree.Leafs
-	n2 := eTree.Leafs
+	})
+	walk(rootPair.Y, 0, func(n *Node, l int) {
+		if n.LastChild == nil {
+			n2 = append(n2, n)
+		}
+	})
+
+	// Compute distance/cost for all nodes.
 	for len(n1) > 0 && len(n2) > 0 {
 		var parents1 []*Node
 		var parents2 []*Node
 		for _, x := range n1 {
-			if isExcluded(x.Signature, exclude) {
-				continue
-			}
 			if x.Parent != nil && !contains(x.Parent, parents1) {
 				parents1 = append(parents1, x.Parent)
 			}
 			for _, y := range n2 {
-				if isExcluded(y.Signature, exclude) {
-					continue
-				}
 				if y.Parent != nil && !contains(y.Parent, parents2) {
 					parents2 = append(parents2, y.Parent)
 				}
 				if x.Signature == y.Signature {
+					if bytesEqual(x.Hash, y.Hash) {
+						pair := NodePair{x, y}
+						minMatching.Add(pair)
+						distTbl.Set(pair, 0)
+						continue
+					}
 					computeDist(x, y, minMatching, distTbl)
 				}
 			}
@@ -533,6 +532,35 @@ func MinCostMatching(oTree, eTree *Tree) (MinCostMatch, DistTable, error) {
 		n2 = parents2
 	}
 	return minMatching, distTbl, nil
+}
+
+// Exclude subtrees with equal hashes from cost calculation.
+// l is used as slider between performance and quality.
+// Higher number reduces quality and icreases performance.
+func excludeEqual(rootX, rootY *Node, l int) {
+	if l <= 0 {
+		return
+	}
+	for x, refX := rootX.LastChild, rootX.LastChild; x != nil; refX, x = refX.PrevSibling, x.PrevSibling {
+		for y, refY := rootY.LastChild, rootY.LastChild; y != nil; refY, y = refY.PrevSibling, y.PrevSibling {
+			if bytesEqual(x.Hash, y.Hash) {
+				// Remove reference to nodes.
+				refX.PrevSibling = x.PrevSibling
+				if x.Parent != nil && x.Parent.LastChild == x {
+					x.Parent.LastChild = x.PrevSibling
+				}
+				refY.PrevSibling = y.PrevSibling
+				if y.Parent != nil && y.Parent.LastChild == y {
+					y.Parent.LastChild = y.PrevSibling
+				}
+				break
+			}
+			if rootX.Signature == rootY.Signature {
+				l--
+				excludeEqual(x, y, l)
+			}
+		}
+	}
 }
 
 type costPair struct {
@@ -554,6 +582,7 @@ func (cp costPairs) Len() int {
 	return len(cp)
 }
 
+// computeDist is only executing if x and y have the same signature.
 func computeDist(x, y *Node, minMatching MinCostMatch, distTbl DistTable) {
 	pair := NodePair{x, y}
 	if x.LastChild == nil && y.LastChild == nil {
@@ -576,7 +605,7 @@ func computeDist(x, y *Node, minMatching MinCostMatch, distTbl DistTable) {
 	}
 	costs := costPairs{}
 	dist := 0
-	// Calculate cost for current roots.
+	// Calculate cost for the current node pair.
 	for sig, childrenX := range groupX {
 		if _, ok := groupY[sig]; ok {
 			for _, chX := range childrenX {
@@ -628,17 +657,6 @@ func contains(n *Node, nodes []*Node) bool {
 	return false
 }
 
-// exclude slice has parent node signature so we are checking
-// if signature is prefixed with them.
-func isExcluded(sig string, exclude []string) bool {
-	for _, excl := range exclude {
-		if strings.HasPrefix(sig, excl) {
-			return true
-		}
-	}
-	return false
-}
-
 // EditScript generates slice of deltas that forms minimum-cost edit
 // script to transform original tree into edited tree.
 func EditScript(oRoot, eRoot *Node, minCostM MinCostMatch, distTbl DistTable) []Delta {
@@ -656,9 +674,6 @@ func EditScript(oRoot, eRoot *Node, minCostM MinCostMatch, distTbl DistTable) []
 	var script []Delta
 	for x := oRoot.LastChild; x != nil; x = x.PrevSibling {
 		for y := eRoot.LastChild; y != nil; y = y.PrevSibling {
-			if bytesEqual(x.Hash, y.Hash) {
-				continue
-			}
 			pair := NodePair{x, y}
 			if _, ok := minCostM[pair]; ok {
 				if x.LastChild == nil && y.LastChild == nil {
