@@ -9,6 +9,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // Operation groups all allowed DOM operations.
@@ -212,6 +213,7 @@ func ParseDoc(r io.Reader) (*Tree, error) {
 					Name:      a.Name.Local,
 					Content:   []byte(a.Value),
 					Signature: buff.String(),
+					Parent:    child,
 				}
 				_, err = io.WriteString(h, attributeType)
 				if err != nil {
@@ -377,22 +379,36 @@ func parentSig(sig string) string {
 // returned.
 // Compare returns nil, nil if there is no difference.
 func Compare(original, edited io.Reader) ([]Delta, error) {
-	oTree, err := ParseDoc(original)
-	if err != nil {
-		return nil, err
+	var originalT, editedT *Tree
+	var originalE, editedE error
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		originalT, originalE = ParseDoc(original)
+
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		editedT, editedE = ParseDoc(edited)
+
+	}()
+	wg.Wait()
+	if originalE != nil || editedE != nil {
+		return nil, fmt.Errorf("Original parsing error: %+v\nEdited parsing error: %+v", originalE, editedE)
 	}
-	eTree, err := ParseDoc(edited)
-	if err != nil {
-		return nil, err
-	}
-	if bytesEqual(oTree.Root.Hash, eTree.Root.Hash) {
+
+	if bytesEqual(originalT.Root.Hash, editedT.Root.Hash) {
 		return nil, nil
 	}
-	minMatch, distTbl, err := MinCostMatching(oTree, eTree)
+
+	minMatch, distTbl, err := MinCostMatching(originalT, editedT)
 	if err != nil {
 		return nil, err
 	}
-	return EditScript(oTree.Root, eTree.Root, minMatch, distTbl), nil
+	return EditScript(originalT.Root, editedT.Root, minMatch, distTbl), nil
 }
 
 // NodePair just pairs up two nodes for easier reference.
@@ -463,102 +479,49 @@ func (dt DistTable) String() string {
 	return out
 }
 
-func pairIn(pair NodePair, pairs []NodePair) bool {
-	for _, p := range pairs {
-		if p == pair {
-			return true
-		}
-	}
-	return false
-}
-
 // MinCostMatching finds minimum-cost matching between two trees.
 func MinCostMatching(oTree, eTree *Tree) (MinCostMatch, DistTable, error) {
 	minMatching := MinCostMatch{}
 	distTbl := DistTable{}
 	// Add document roots to the min matching table.
-	rootPair := NodePair{oTree.Root, eTree.Root}
-	minMatching.Add(rootPair)
-	// If there is only one child node per document root use them as roots.
-	if rootPair.X.LastChild.PrevSibling == nil && rootPair.Y.LastChild.PrevSibling == nil {
-		rootPair.X = oTree.Root.LastChild
-		rootPair.Y = eTree.Root.LastChild
-	}
-	if rootPair.X.Signature != rootPair.Y.Signature {
-		return minMatching, distTbl, nil
-	}
-	minMatching.Add(rootPair)
+	minMatching.Add(NodePair{oTree.Root, eTree.Root})
 
-	excludeEqual(rootPair.X, rootPair.Y, 2)
+	excludeEqualSubtrees(oTree.Root, eTree.Root)
+	computeDist(oTree.Root, eTree.Root, minMatching, distTbl)
 
-	// Find all leaf nodes.
-	var n1 []*Node
-	var n2 []*Node
-	walk(rootPair.X, 0, func(n *Node, l int) {
-		if n.LastChild == nil {
-			n1 = append(n1, n)
-		}
-	})
-	walk(rootPair.Y, 0, func(n *Node, l int) {
-		if n.LastChild == nil {
-			n2 = append(n2, n)
-		}
-	})
-
-	// Compute distance/cost for all nodes.
-	for len(n1) > 0 && len(n2) > 0 {
-		var parents1 []*Node
-		var parents2 []*Node
-		for _, x := range n1 {
-			if x.Parent != nil && !contains(x.Parent, parents1) {
-				parents1 = append(parents1, x.Parent)
-			}
-			for _, y := range n2 {
-				if y.Parent != nil && !contains(y.Parent, parents2) {
-					parents2 = append(parents2, y.Parent)
-				}
-				if x.Signature == y.Signature {
-					if bytesEqual(x.Hash, y.Hash) {
-						pair := NodePair{x, y}
-						minMatching.Add(pair)
-						distTbl.Set(pair, 0)
-						continue
-					}
-					computeDist(x, y, minMatching, distTbl)
-				}
-			}
-		}
-		n1 = parents1
-		n2 = parents2
-	}
 	return minMatching, distTbl, nil
 }
 
 // Exclude subtrees with equal hashes from cost calculation.
-// l is used as slider between performance and quality.
-// Higher number reduces quality and icreases performance.
-func excludeEqual(rootX, rootY *Node, l int) {
-	if l <= 0 {
-		return
+func excludeEqualSubtrees(x, y *Node) {
+	for childX := x.LastChild; childX != nil; childX = childX.PrevSibling {
+		for childY := y.LastChild; childY != nil; childY = childY.PrevSibling {
+			if childX.Signature == childY.Signature {
+				if bytesEqual(childX.Hash, childY.Hash) {
+					// Remove reference to nodes to reduce matching space.
+					removeNode(childX)
+					removeNode(childY)
+					break
+				}
+				excludeEqualSubtrees(childX, childY)
+			}
+		}
 	}
-	for x, refX := rootX.LastChild, rootX.LastChild; x != nil; refX, x = refX.PrevSibling, x.PrevSibling {
-		for y, refY := rootY.LastChild, rootY.LastChild; y != nil; refY, y = refY.PrevSibling, y.PrevSibling {
-			if bytesEqual(x.Hash, y.Hash) {
-				// Remove reference to nodes.
-				refX.PrevSibling = x.PrevSibling
-				if x.Parent != nil && x.Parent.LastChild == x {
-					x.Parent.LastChild = x.PrevSibling
-				}
-				refY.PrevSibling = y.PrevSibling
-				if y.Parent != nil && y.Parent.LastChild == y {
-					y.Parent.LastChild = y.PrevSibling
-				}
-				break
+}
+
+func removeNode(n *Node) {
+	if n.Parent.LastChild == n {
+		n.Parent.LastChild = n.PrevSibling
+	} else {
+		m := n.Parent.LastChild.PrevSibling
+		ref := n.Parent.LastChild
+		for m != nil {
+			if m == n {
+				ref.PrevSibling = m.PrevSibling
+				return
 			}
-			if rootX.Signature == rootY.Signature {
-				l--
-				excludeEqual(x, y, l)
-			}
+			ref = m
+			m = m.PrevSibling
 		}
 	}
 }
@@ -584,14 +547,23 @@ func (cp costPairs) Len() int {
 
 // computeDist is only executing if x and y have the same signature.
 func computeDist(x, y *Node, minMatching MinCostMatch, distTbl DistTable) {
+	if x.Signature != y.Signature {
+		return
+	}
 	pair := NodePair{x, y}
 	if x.LastChild == nil && y.LastChild == nil {
+		// Calculate cost for leaf nodes.
 		minMatching.Add(pair)
 		if bytesEqual(x.Content, y.Content) {
 			distTbl.Set(pair, 0)
 		} else {
 			distTbl.Set(pair, 1)
 		}
+		return
+	} else if x.LastChild == nil || y.LastChild == nil {
+		// Calculate cost for elements without children.
+		minMatching.Add(pair)
+		distTbl.Set(pair, 1)
 		return
 	}
 	// Group children of the non-leaf nodes by signature.
@@ -643,6 +615,8 @@ func computeDist(x, y *Node, minMatching MinCostMatch, distTbl DistTable) {
 				// Insert cost.
 				dist++
 			}
+		} else {
+			dist += len(childrenX)
 		}
 	}
 	distTbl.Set(pair, dist)

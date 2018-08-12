@@ -72,6 +72,35 @@ func TestParseDoc(t *testing.T) {
 	}
 }
 
+func TestRootLeafDifference(t *testing.T) {
+	orig := "<outer></outer>"
+	edit := "<outer><job>Teacher</job></outer>"
+
+	deltas, err := Compare(
+		strings.NewReader(orig),
+		strings.NewReader(edit),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deltas) != 1 {
+		t.Errorf("Incorrect number of deltas, got %d.", len(deltas))
+		t.Logf("%+v", deltas)
+	}
+	// Try reversed compare.
+	deltas, err = Compare(
+		strings.NewReader(edit),
+		strings.NewReader(orig),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deltas) != 1 {
+		t.Errorf("Incorrect number of deltas, got %d.", len(deltas))
+		t.Logf("%+v", deltas)
+	}
+}
+
 func TestCompare(t *testing.T) {
 	deltas, err := Compare(
 		strings.NewReader(originalDoc),
