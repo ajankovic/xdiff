@@ -164,8 +164,8 @@ func (p *Standard) ParseFile(filepath string) (*xtree.Node, error) {
 //  `- Child2.xml
 // 	 `- rootElement
 //
-// Use ErrorOnNonXMLFiles flag on the parser to configure behavior for handling
-// non xml files found in the directories.
+// Use NonXMLHandler flag on the parser to configure behavior for handling
+// non-xml files found in the directories.
 func (p *Standard) ParseDir(dirpath string) (*xtree.Node, error) {
 	d, err := os.Open(dirpath)
 	if err != nil {
@@ -208,6 +208,9 @@ func (p *Standard) parseDirFile(filepath string, fi os.FileInfo) (*xtree.Node, e
 
 	b := make([]byte, 4)
 	_, err = f.Read(b)
+	if err == io.EOF {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
