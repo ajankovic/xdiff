@@ -5,30 +5,27 @@ import (
 	"io"
 )
 
-// Encoder knows how to interpret diff results.
-type Encoder interface {
-	Encode([]Delta) error
-}
-
-type plainTextEncoder struct {
+// TextEncoder knows how to convert edit script to plain text.
+type TextEncoder struct {
 	w io.Writer
 }
 
-func (pte *plainTextEncoder) Encode(deltas []Delta) error {
+// Encode sends edit script in plain text to the stream.
+func (pte *TextEncoder) Encode(deltas []Delta) error {
 	if len(deltas) == 0 {
 		fmt.Fprint(pte.w, "No difference.\n")
 	}
 	for _, d := range deltas {
-		if d.Op == Update {
-			fmt.Fprintf(pte.w, "%s('%s'->'%s')\n", d.Op, d.Node, d.Update)
+		if d.Operation == Update {
+			fmt.Fprintf(pte.w, "%s('%s'->'%s')\n", d.Operation, d.Subject, d.Object)
 			continue
 		}
-		fmt.Fprintf(pte.w, "%s('%s')\n", d.Op, d.Node)
+		fmt.Fprintf(pte.w, "%s('%s')\n", d.Operation, d.Subject)
 	}
 	return nil
 }
 
-// PlainTextEncoder outputs diff results in plain text format.
-func PlainTextEncoder(w io.Writer) Encoder {
-	return &plainTextEncoder{w}
+// NewTextEncoder creates new text encoder.
+func NewTextEncoder(w io.Writer) *TextEncoder {
+	return &TextEncoder{w}
 }

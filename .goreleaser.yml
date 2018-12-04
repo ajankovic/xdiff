@@ -1,0 +1,40 @@
+before:
+  hooks:
+    - go mod download
+    - go generate ./...
+brew:
+  name: xdiff
+  description: "Generate edit scripts between xml documents."
+  commit_author:
+    name: Aleksandar Janković
+    email: office@ajankovic.com
+  install: bin.install "xdiff"
+scoop:
+  name: xdiff
+  description: "Generate edit scripts between xml documents."
+  commit_author:
+    name: Aleksandar Janković
+    email: office@ajankovic.com
+  url_template: https://github.com/ajankovic/xdiff/releases/download/{{ .Tag }}/{{
+    .ArtifactName }}
+builds:
+- env:
+  - CGO_ENABLED=0
+  main: ./cmd/xdiff/main.go
+archive:
+  replacements:
+    darwin: Darwin
+    linux: Linux
+    windows: Windows
+    386: i386
+    amd64: x86_64
+checksum:
+  name_template: 'checksums.txt'
+snapshot:
+  name_template: "{{ .Tag }}-next"
+changelog:
+  sort: asc
+  filters:
+    exclude:
+    - '^docs:'
+    - '^test:'

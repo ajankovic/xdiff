@@ -1,35 +1,18 @@
+// Package xdiff provides an implementation of the X-Diff algorithm used for finding
+// minimum edit script between two xml documents.
+//
+//go:generate stringer -type=Operation
 package xdiff
 
 import (
-	"bytes"
-	"crypto/sha1"
-	"encoding/hex"
-	"encoding/xml"
 	"fmt"
-	"io"
 	"sort"
-	"strings"
-	"sync"
+
+	"github.com/ajankovic/xdiff/xtree"
 )
 
-// Operation groups all allowed DOM operations.
+// Operation defines possible modifying operations of the edit script.
 type Operation int
-
-func (o Operation) String() string {
-	switch o {
-	case Insert:
-		return "Insert"
-	case Update:
-		return "Update"
-	case Delete:
-		return "Delete"
-	case InsertSubtree:
-		return "InsertSubtree"
-	case DeleteSubtree:
-		return "DeleteSubtree"
-	}
-	return "UnknownOperation"
-}
 
 const (
 	// Insert leaf node.
@@ -44,434 +27,88 @@ const (
 	DeleteSubtree
 )
 
-const (
-	elementType   = "elem"
-	attributeType = "attr"
-	textType      = "text"
-	commentType   = "comm"
-	directiveType = "dire"
-	procInstType  = "proc"
-)
-
 // Delta is a unit of change to the original doc that would change it into
 // edited document.
 type Delta struct {
-	Op     Operation
-	Node   *Node
-	Update *Node
+	Operation Operation
+	Subject   *xtree.Node
+	Object    *xtree.Node
 }
 
-// CompareStrings is just helper to compare strings instead of readers.
-func CompareStrings(original, edited string) ([]Delta, error) {
-	return Compare(strings.NewReader(original), strings.NewReader(edited))
+// nodePair just pairs up two nodes for easier reference.
+type nodePair struct {
+	Left  *xtree.Node
+	Right *xtree.Node
 }
 
-// Node coresponds to one xml node.
-type Node struct {
-	Parent      *Node
-	LastChild   *Node
-	PrevSibling *Node
-	Name        string
-	Content     []byte
-	Hash        []byte
-	Signature   string
-}
-
-// IsRoot determines if node is root node of the tree.
-func (n *Node) IsRoot() bool {
-	return n.Parent == nil
-}
-
-func (n *Node) String() string {
-	hash := hex.EncodeToString(n.Hash)
-	child := ""
-	if n.LastChild == nil {
-		child = string(n.Content)
-	} else if n.LastChild.Name == "" {
-		child = string(n.LastChild.Content)
-	}
-	if n.Name != "" {
-		return fmt.Sprintf("[%s] %s:%s {%s}",
-			n.Signature, n.Name, child, hash)
-	}
-	if n.Content != nil {
-		return fmt.Sprintf("[%s] %q {%s}", n.Signature, n.Content, hash)
-	}
-	return fmt.Sprintf("[%s] ROOT {%s}", n.Signature, hash)
-}
-
-// Tree groups needed elements for comparing documents.
-type Tree struct {
-	Root *Node
-}
-
-func (t *Tree) String() string {
-	out := ""
-	walk(t.Root, 0, func(n *Node, level int) {
-		out += fmt.Sprintf("%s> %s\n",
-			strings.Repeat("-", level), n.String())
-	})
-	return out
-}
-
-func walk(n *Node, level int, f func(n *Node, level int)) {
-	for sbl := n; sbl != nil; sbl = sbl.PrevSibling {
-		f(sbl, level)
-		if sbl.LastChild != nil {
-			walk(sbl.LastChild, level+1, f)
-		}
-	}
-}
-
-type hashes [][]byte
-
-func (h hashes) Less(i, j int) bool {
-	l := len(h[i])
-	if len(h[i]) > len(h[j]) {
-		l = len(h[j])
-	}
-	for k := 0; k < l; k++ {
-		if h[i][k] < h[j][k] {
-			return true
-		}
-	}
-	return false
-}
-
-func (h hashes) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-}
-
-func (h hashes) Len() int {
-	return len(h)
-}
-
-type buffer struct {
-	bytes.Buffer
-	err error
-	n   int
-}
-
-func (b *buffer) Concat(strs ...string) (n int, err error) {
-	for _, s := range strs {
-		if b.err == nil {
-			b.n, b.err = b.Buffer.WriteString(s)
-		}
-	}
-	return b.n, b.err
-}
-
-func (b *buffer) Error() error {
-	return b.err
-}
-
-func addChild(parent, child *Node) {
-	if parent.LastChild == nil {
-		parent.LastChild = child
-	} else {
-		child.PrevSibling = parent.LastChild
-		parent.LastChild = child
-	}
-}
-
-// ParseDoc parses xml and returns root node. Each node in the
-// parsed tree is hashed.
-func ParseDoc(r io.Reader) (*Tree, error) {
-	t := &Tree{
-		Root: &Node{Signature: "/"},
-	}
-	dec := xml.NewDecoder(r)
-	current := t.Root
-	var buff buffer
-	h := sha1.New()
-	for {
-		tok, err := dec.Token()
-		if err != nil && err != io.EOF {
-			return nil, err
-		}
-		if tok == nil {
-			break
-		}
-		switch el := tok.(type) {
-		case xml.StartElement:
-			_, err := buff.Concat(parentSig(current.Signature), "/", el.Name.Local, "/", elementType)
-			if err != nil {
-				return nil, err
-			}
-			child := &Node{
-				Name:      el.Name.Local,
-				Parent:    current,
-				Signature: buff.String(),
-			}
-			for _, a := range el.Attr {
-				buff.Reset()
-				_, err := buff.Concat(parentSig(child.Signature), "/", a.Name.Local, "/", attributeType)
-				if err != nil {
-					return nil, err
-				}
-				attr := &Node{
-					Name:      a.Name.Local,
-					Content:   []byte(a.Value),
-					Signature: buff.String(),
-					Parent:    child,
-				}
-				_, err = io.WriteString(h, attributeType)
-				if err != nil {
-					return nil, err
-				}
-				_, err = io.WriteString(h, attr.Name)
-				if err != nil {
-					return nil, err
-				}
-				_, err = h.Write(attr.Content)
-				if err != nil {
-					return nil, err
-				}
-				attr.Hash = h.Sum(nil)
-				addChild(child, attr)
-			}
-			addChild(current, child)
-			current = child
-		case xml.EndElement:
-			// Compute node hash as sum of all children
-			// with node type and name.
-			_, err := io.WriteString(h, elementType)
-			if err != nil {
-				return nil, err
-			}
-			_, err = io.WriteString(h, current.Name)
-			if err != nil {
-				return nil, err
-			}
-			if current.LastChild != nil {
-				var hs hashes
-				for sbl := current.LastChild; sbl != nil; sbl = sbl.PrevSibling {
-					hs = append(hs, sbl.Hash)
-				}
-				if len(hs) > 1 {
-					// Sorting hashes to ensure unordered model.
-					sort.Sort(hs)
-				}
-				for _, hash := range hs {
-					_, err := h.Write(hash)
-					if err != nil {
-						return nil, err
-					}
-				}
-			}
-			current.Hash = h.Sum(nil)
-			current = current.Parent
-		case xml.CharData:
-			content := make([]byte, len(el))
-			copy(content, el)
-			if strings.TrimSpace(string(content)) == "" {
-				continue
-			}
-			_, err := buff.Concat(parentSig(current.Signature), "/", textType)
-			if err != nil {
-				return nil, err
-			}
-			child := &Node{
-				Parent:    current,
-				Content:   content,
-				Signature: buff.String(),
-			}
-			_, err = io.WriteString(h, textType)
-			if err != nil {
-				return nil, err
-			}
-			_, err = h.Write(child.Content)
-			if err != nil {
-				return nil, err
-			}
-			child.Hash = h.Sum(nil)
-			addChild(current, child)
-		case xml.Comment:
-			_, err := buff.Concat(parentSig(current.Signature), "/", commentType)
-			if err != nil {
-				return nil, err
-			}
-			content := make([]byte, len(el))
-			copy(content, el)
-			child := &Node{
-				Parent:    current,
-				Content:   content,
-				Signature: buff.String(),
-			}
-			_, err = io.WriteString(h, commentType)
-			if err != nil {
-				return nil, err
-			}
-			_, err = h.Write(child.Content)
-			if err != nil {
-				return nil, err
-			}
-			child.Hash = h.Sum(nil)
-			addChild(current, child)
-		case xml.Directive:
-			_, err := buff.Concat(parentSig(current.Signature), "/", directiveType)
-			if err != nil {
-				return nil, err
-			}
-			content := make([]byte, len(el))
-			copy(content, el)
-			child := &Node{
-				Parent:    current,
-				Content:   content,
-				Signature: buff.String(),
-			}
-			_, err = io.WriteString(h, directiveType)
-			if err != nil {
-				return nil, err
-			}
-			_, err = h.Write(child.Content)
-			if err != nil {
-				return nil, err
-			}
-			child.Hash = h.Sum(nil)
-			addChild(current, child)
-		case xml.ProcInst:
-			if el.Target == "xml" {
-				continue
-			}
-			_, err := buff.Concat(parentSig(current.Signature), "/", el.Target, "/", procInstType)
-			if err != nil {
-				return nil, err
-			}
-			child := &Node{
-				Parent:    current,
-				Content:   append([]byte(el.Target), el.Inst...),
-				Signature: buff.String(),
-			}
-			_, err = io.WriteString(h, procInstType)
-			if err != nil {
-				return nil, err
-			}
-			_, err = h.Write(child.Content)
-			if err != nil {
-				return nil, err
-			}
-			child.Hash = h.Sum(nil)
-			addChild(current, child)
-		}
-		buff.Reset()
-		h.Reset()
-	}
-	for sbl := current.LastChild; sbl != nil; sbl = sbl.PrevSibling {
-		_, err := h.Write(sbl.Hash)
-		if err != nil {
-			return nil, err
-		}
-	}
-	current.Hash = h.Sum(nil)
-	return t, nil
-}
-
-func parentSig(sig string) string {
-	if len(sig) > 5 {
-		return sig[:len(sig)-5]
-	}
-	return sig
-}
-
-// Compare runs X-Diff comparing algorithm on the provided arguments.
-// Original reader is compared to edited and slice of deltas is
-// returned.
-// Compare returns nil, nil if there is no difference.
-func Compare(original, edited io.Reader) ([]Delta, error) {
-	var originalT, editedT *Tree
-	var originalE, editedE error
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		originalT, originalE = ParseDoc(original)
-
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		editedT, editedE = ParseDoc(edited)
-
-	}()
-	wg.Wait()
-	if originalE != nil || editedE != nil {
-		return nil, fmt.Errorf("Original parsing error: %+v\nEdited parsing error: %+v", originalE, editedE)
-	}
-
-	if bytesEqual(originalT.Root.Hash, editedT.Root.Hash) {
-		return nil, nil
-	}
-
-	minMatch, distTbl, err := MinCostMatching(originalT, editedT)
-	if err != nil {
-		return nil, err
-	}
-	return EditScript(originalT.Root, editedT.Root, minMatch, distTbl), nil
-}
-
-// NodePair just pairs up two nodes for easier reference.
-type NodePair struct {
-	X *Node
-	Y *Node
-}
-
-// MinCostMatch is table of matched node pairs.
-type MinCostMatch map[NodePair]struct{}
+// minCostMatch is table of matched node pairs.
+type minCostMatch map[nodePair]struct{}
 
 // Add idempotently adds new match to the given index.
-func (mcm MinCostMatch) Add(match NodePair) MinCostMatch {
+func (mcm minCostMatch) Add(match nodePair) minCostMatch {
 	_, ok := mcm[match]
-	if !ok {
+	if !ok && !mcm.HasLeft(match.Left) && !mcm.HasRight(match.Right) {
 		mcm[match] = struct{}{}
+		leftParent := match.Left.Parent
+		rightParent := match.Right.Parent
+		for leftParent != nil && rightParent != nil {
+			mcm[nodePair{leftParent, rightParent}] = struct{}{}
+			leftParent = leftParent.Parent
+			rightParent = rightParent.Parent
+		}
 	}
 	return mcm
 }
 
-// HasX detects if match has node in x position.
-func (mcm MinCostMatch) HasX(n *Node) bool {
+// HasPair returns true if match table has pair matched.
+func (mcm minCostMatch) HasPair(match nodePair) bool {
+	_, ok := mcm[match]
+	return ok
+}
+
+// HasLeft returns true if match table has the node in left position.
+func (mcm minCostMatch) HasLeft(n *xtree.Node) bool {
 	for p := range mcm {
-		if p.X == n {
+		if p.Left == n {
 			return true
 		}
 	}
 	return false
 }
 
-// HasY detects if match has node in y position.
-func (mcm MinCostMatch) HasY(n *Node) bool {
+// HasRight returns true if match table has the node in right position.
+func (mcm minCostMatch) HasRight(n *xtree.Node) bool {
 	for p := range mcm {
-		if p.Y == n {
+		if p.Right == n {
 			return true
 		}
 	}
 	return false
 }
 
-func (mcm MinCostMatch) String() string {
+func (mcm minCostMatch) String() string {
 	out := ""
 	for pair := range mcm {
-		out += fmt.Sprintf("%s\n\n", pair)
+		out += fmt.Sprintf("%s\n", pair)
 	}
 	return out
 }
 
-// DistTable maps pairs with costs.
-type DistTable map[NodePair]int
+// distTable holds editing distance from one pair to the other.
+type distTable map[nodePair]int
 
-// Has determines if cost for the pair is already set.
-func (dt DistTable) Has(pair NodePair) bool {
+// Has determines if distance for the pair is already set.
+func (dt distTable) Has(pair nodePair) bool {
 	_, ok := dt[pair]
 	return ok
 }
 
-// Set updates cost for pair in the table.
-func (dt DistTable) Set(pair NodePair, cost int) {
+// Set updates pair distance.
+func (dt distTable) Set(pair nodePair, cost int) {
 	dt[pair] = cost
 }
 
-func (dt DistTable) String() string {
+func (dt distTable) String() string {
 	out := ""
 	for pair, cost := range dt {
 		out += fmt.Sprintf("%s -> %d\n", pair, cost)
@@ -479,55 +116,8 @@ func (dt DistTable) String() string {
 	return out
 }
 
-// MinCostMatching finds minimum-cost matching between two trees.
-func MinCostMatching(oTree, eTree *Tree) (MinCostMatch, DistTable, error) {
-	minMatching := MinCostMatch{}
-	distTbl := DistTable{}
-	// Add document roots to the min matching table.
-	minMatching.Add(NodePair{oTree.Root, eTree.Root})
-
-	excludeEqualSubtrees(oTree.Root, eTree.Root)
-	computeDist(oTree.Root, eTree.Root, minMatching, distTbl)
-
-	return minMatching, distTbl, nil
-}
-
-// Exclude subtrees with equal hashes from cost calculation.
-func excludeEqualSubtrees(x, y *Node) {
-	for childX := x.LastChild; childX != nil; childX = childX.PrevSibling {
-		for childY := y.LastChild; childY != nil; childY = childY.PrevSibling {
-			if childX.Signature == childY.Signature {
-				if bytesEqual(childX.Hash, childY.Hash) {
-					// Remove reference to nodes to reduce matching space.
-					removeNode(childX)
-					removeNode(childY)
-					break
-				}
-				excludeEqualSubtrees(childX, childY)
-			}
-		}
-	}
-}
-
-func removeNode(n *Node) {
-	if n.Parent.LastChild == n {
-		n.Parent.LastChild = n.PrevSibling
-	} else {
-		m := n.Parent.LastChild.PrevSibling
-		ref := n.Parent.LastChild
-		for m != nil {
-			if m == n {
-				ref.PrevSibling = m.PrevSibling
-				return
-			}
-			ref = m
-			m = m.PrevSibling
-		}
-	}
-}
-
 type costPair struct {
-	NodePair
+	nodePair
 	Cost int
 }
 
@@ -545,139 +135,226 @@ func (cp costPairs) Len() int {
 	return len(cp)
 }
 
-// computeDist is only executing if x and y have the same signature.
-func computeDist(x, y *Node, minMatching MinCostMatch, distTbl DistTable) {
-	if x.Signature != y.Signature {
+// Compare generates slice of deltas that forms minimum-cost edit
+// script to transform the left xtree into the right xtree.
+func Compare(left *xtree.Node, right *xtree.Node) ([]Delta, error) {
+	if bytesEqual(left.Hash, right.Hash) {
+		return nil, nil
+	}
+
+	reduceMatchingSpace(left, right)
+
+	distTbl := make(distTable)
+	minCostM := make(minCostMatch)
+	minCostM.Add(nodePair{left, right})
+	var leftS, rightS xtree.Stack
+	var leftLastVisited, rightLastVisited *xtree.Node
+	var l, r = left, right
+	for !leftS.IsEmpty() || l != nil {
+		if l != nil {
+			leftS.Push(l)
+			l = l.FirstChild
+		} else {
+			leftPeek := leftS.Peek()
+			if leftPeek.NextSibling != nil && leftLastVisited != leftPeek.NextSibling {
+				l = leftPeek.NextSibling
+			} else {
+				r = right
+				for !rightS.IsEmpty() || r != nil {
+					if r != nil {
+						rightS.Push(r)
+						r = r.FirstChild
+					} else {
+						rightPeek := rightS.Peek()
+						if rightPeek.NextSibling != nil && rightLastVisited != rightPeek.NextSibling {
+							r = rightPeek.NextSibling
+						} else {
+							match(leftPeek, rightPeek, distTbl, minCostM)
+							rightLastVisited, _ = rightS.Pop()
+						}
+					}
+				}
+				leftLastVisited, _ = leftS.Pop()
+			}
+		}
+	}
+	costBySig := make(map[string]costPairs)
+	for pair, cost := range distTbl {
+		if _, ok := costBySig[string(pair.Left.Signature)]; !ok {
+			costBySig[string(pair.Left.Signature)] = costPairs{costPair{pair, cost}}
+		} else {
+			costBySig[string(pair.Left.Signature)] = append(costBySig[string(pair.Left.Signature)], costPair{pair, cost})
+		}
+	}
+	for _, costs := range costBySig {
+		if len(costs) > 1 {
+			sort.Sort(costs)
+		}
+		for _, cost := range costs {
+			minCostM.Add(cost.nodePair)
+		}
+	}
+
+	return editScript(left, right, minCostM), nil
+}
+
+// reduceMatchingSpace removes nodes with the same signature and hash value
+// to reduce number of comparisons for the matching step.
+// Every matching child is removed except one which is needed prerequisite for more
+// accurate matching between subtrees.
+func reduceMatchingSpace(left, right *xtree.Node) {
+	l := left.FirstChild
+	r := right.FirstChild
+
+	var candidates []nodePair
+	for l != nil && r != nil {
+		leftNext := l.NextSibling
+		rightNext := r.NextSibling
+		if (l.Type == xtree.Element && r.Type == xtree.Element) &&
+			bytesEqual(l.Signature, r.Signature) {
+			if bytesEqual(l.Hash, r.Hash) {
+				candidates = append(candidates, nodePair{l, r})
+			} else {
+				reduceMatchingSpace(l, r)
+			}
+		}
+		l = leftNext
+		r = rightNext
+	}
+	for i := 0; i < len(candidates)-1; i++ {
+		candidates[i].Left.Remove()
+		candidates[i].Right.Remove()
+	}
+}
+
+func match(l, r *xtree.Node, distTbl distTable, minCostM minCostMatch) {
+	if !bytesEqual(l.Signature, r.Signature) {
 		return
 	}
-	pair := NodePair{x, y}
-	if x.LastChild == nil && y.LastChild == nil {
-		// Calculate cost for leaf nodes.
-		minMatching.Add(pair)
-		if bytesEqual(x.Content, y.Content) {
-			distTbl.Set(pair, 0)
-		} else {
-			distTbl.Set(pair, 1)
-		}
+	pair := nodePair{l, r}
+	if bytesEqual(l.Hash, r.Hash) {
+		// Nodes match, no cost.
+		distTbl.Set(pair, 0)
+		minCostM.Add(pair)
 		return
-	} else if x.LastChild == nil || y.LastChild == nil {
-		// Calculate cost for elements without children.
-		minMatching.Add(pair)
+	}
+	if l.FirstChild == nil && r.FirstChild == nil {
+		// Set distance for Update.
 		distTbl.Set(pair, 1)
+		return
+	} else if l.FirstChild == nil {
+		// Set distance for inserting all missing children into left.
+		distTbl.Set(pair, len(r.Children()))
+		return
+	} else if r.FirstChild == nil {
+		// Set distance for deleting all children from left tree.
+		distTbl.Set(pair, len(l.Children()))
 		return
 	}
 	// Group children of the non-leaf nodes by signature.
-	groupX := make(map[string][]*Node)
-	groupY := make(map[string][]*Node)
-	for ch := x.LastChild; ch != nil; ch = ch.PrevSibling {
-		groupX[ch.Signature] = append(groupX[ch.Signature], ch)
+	leftG := make(map[string][]*xtree.Node)
+	rightG := make(map[string][]*xtree.Node)
+	leftCount := 0
+	rightCount := 0
+	for ch := l.FirstChild; ch != nil; ch = ch.NextSibling {
+		leftCount++
+		leftG[string(ch.Signature)] = append(leftG[string(ch.Signature)], ch)
 	}
-	for ch := y.LastChild; ch != nil; ch = ch.PrevSibling {
-		groupY[ch.Signature] = append(groupY[ch.Signature], ch)
+	for ch := r.FirstChild; ch != nil; ch = ch.NextSibling {
+		rightCount++
+		rightG[string(ch.Signature)] = append(rightG[string(ch.Signature)], ch)
 	}
-	costs := costPairs{}
+
+	var costs costPairs
 	dist := 0
-	// Calculate cost for the current node pair.
-	for sig, childrenX := range groupX {
-		if _, ok := groupY[sig]; ok {
-			for _, chX := range childrenX {
-				for _, chY := range groupY[sig] {
-					pair := NodePair{chX, chY}
-					c, ok := distTbl[pair]
-					if !ok {
-						computeDist(chX, chY, minMatching, distTbl)
-						c = distTbl[pair]
-					}
-					costs = append(costs, costPair{NodePair: pair, Cost: c})
+	for sig, leftChildren := range leftG {
+		if rightChildren, ok := rightG[sig]; ok {
+			for _, leftCh := range leftChildren {
+				for _, rightCh := range rightChildren {
+					pair := nodePair{leftCh, rightCh}
+					c := distTbl[pair]
+					costs = append(costs, costPair{nodePair: pair, Cost: c})
 				}
 			}
-			if len(costs) > 1 {
-				sort.Sort(costs)
-			}
-			for _, cost := range costs {
-				if contains(cost.X, childrenX) && contains(cost.Y, groupY[sig]) {
-					if !minMatching.HasX(cost.X) && !minMatching.HasY(cost.Y) {
-						minMatching.Add(cost.NodePair)
-					}
-					// Calculate cost for mapped nodes.
-					d, ok := distTbl[cost.NodePair]
-					if ok {
-						dist += d
-						continue
-					}
-					// Delete + Insert cost.
-					dist++
-					continue
-				}
-				// Handle unmapped nodes.
-				// Delete cost.
-				dist++
-				// Insert cost.
-				dist++
-			}
-		} else {
-			dist += len(childrenX)
 		}
 	}
+	if len(costs) > 1 {
+		sort.Sort(costs)
+	}
+	usedLeft := make(map[*xtree.Node]struct{})
+	usedRight := make(map[*xtree.Node]struct{})
+	mapped := 0
+	for _, cost := range costs {
+		if _, ok := usedLeft[cost.Left]; ok {
+			continue
+		}
+		if _, ok := usedRight[cost.Right]; ok {
+			continue
+		}
+		dist += cost.Cost
+		mapped++
+		usedLeft[cost.Left] = struct{}{}
+		usedRight[cost.Right] = struct{}{}
+	}
+	dist += leftCount + rightCount - 2*mapped
+
 	distTbl.Set(pair, dist)
 }
 
-func contains(n *Node, nodes []*Node) bool {
+// editScript generates slice of deltas that forms minimum-cost edit script to transform
+// left xtree into a right xtree.
+// TODO change algorithm to the iterative traversal
+func editScript(left, right *xtree.Node, minCostM minCostMatch) []Delta {
+	var script []Delta
+	rootPair := nodePair{left, right}
+	_, ok := minCostM[rootPair]
+	if !ok {
+		return []Delta{
+			Delta{Operation: DeleteSubtree, Subject: left, Object: left.Parent},
+			Delta{Operation: InsertSubtree, Subject: right, Object: left.Parent},
+		}
+	}
+	for l := left.FirstChild; l != nil; l = l.NextSibling {
+		for r := right.FirstChild; r != nil; r = r.NextSibling {
+			pair := nodePair{l, r}
+			if _, ok := minCostM[pair]; ok {
+				if l.FirstChild == nil && r.FirstChild == nil {
+					if bytesEqual(l.Hash, r.Hash) {
+						continue
+					}
+					script = append(script, Delta{Operation: Update, Subject: l, Object: r})
+					continue
+				}
+				script = append(script, editScript(l, r, minCostM)...)
+			}
+		}
+		if !minCostM.HasLeft(l) {
+			if l.FirstChild == nil {
+				script = append(script, Delta{Operation: Delete, Subject: l, Object: l.Parent})
+				continue
+			}
+			script = append(script, Delta{Operation: DeleteSubtree, Subject: l, Object: l.Parent})
+		}
+	}
+	for r := right.FirstChild; r != nil; r = r.NextSibling {
+		if !minCostM.HasRight(r) {
+			if r.FirstChild == nil {
+				script = append(script, Delta{Operation: Insert, Subject: r, Object: r.Parent})
+				continue
+			}
+			script = append(script, Delta{Operation: InsertSubtree, Subject: r, Object: r.Parent})
+		}
+	}
+	return script
+}
+
+func contains(n *xtree.Node, nodes []*xtree.Node) bool {
 	for _, x := range nodes {
 		if x == n {
 			return true
 		}
 	}
 	return false
-}
-
-// EditScript generates slice of deltas that forms minimum-cost edit
-// script to transform original tree into edited tree.
-func EditScript(oRoot, eRoot *Node, minCostM MinCostMatch, distTbl DistTable) []Delta {
-	rootPair := NodePair{oRoot, eRoot}
-	_, ok := minCostM[rootPair]
-	if !ok {
-		return []Delta{
-			Delta{Op: DeleteSubtree, Node: oRoot},
-			Delta{Op: InsertSubtree, Node: eRoot},
-		}
-	}
-	if distTbl[rootPair] == 0 {
-		return nil
-	}
-	var script []Delta
-	for x := oRoot.LastChild; x != nil; x = x.PrevSibling {
-		for y := eRoot.LastChild; y != nil; y = y.PrevSibling {
-			pair := NodePair{x, y}
-			if _, ok := minCostM[pair]; ok {
-				if x.LastChild == nil && y.LastChild == nil {
-					if distTbl[pair] == 0 {
-						continue
-					}
-					script = append(script, Delta{Op: Update, Node: x, Update: y})
-					continue
-				}
-				script = append(script, EditScript(x, y, minCostM, distTbl)...)
-			}
-		}
-		if !minCostM.HasX(x) {
-			if x.LastChild == nil {
-				script = append(script, Delta{Op: Delete, Node: x})
-				continue
-			}
-			script = append(script, Delta{Op: DeleteSubtree, Node: x})
-		}
-	}
-	for y := eRoot.LastChild; y != nil; y = y.PrevSibling {
-		if !minCostM.HasY(y) {
-			if y.LastChild == nil {
-				script = append(script, Delta{Op: Insert, Node: y})
-				continue
-			}
-			script = append(script, Delta{Op: InsertSubtree, Node: y})
-		}
-	}
-	return script
 }
 
 func bytesEqual(a, b []byte) bool {
